@@ -1,0 +1,123 @@
+name: FreeCloud 每日签到+续费
+
+on:
+  schedule:
+    - cron: '30 1 * * *'   # 每天 UTC 01:30（北京时间 09:30）
+  workflow_dispatch:
+    inputs:
+      enable_recording:
+        description: '是否录屏（true=录屏 / false=不录屏）'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      renew_threshold_days:
+        description: '提前几天自动续费（默认10天，调试可填40）'
+        required: false
+        default: '10'
+        type: string
+
+jobs:
+  sign-renew:
+    name: 签到 + 续费检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装系统依赖（Chrome + Xvfb + 中文字体）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libglib2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
+            libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+            libxss1 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libgbm1 \
+            fonts-liberation fonts-noto-cjk xvfb ffmpeg curl unzip
+
+      - name: 安装 Python 依赖
+        run: pip install seleniumbase pyautogui
+
+      - name: 启动虚拟显示（Xvfb）
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+
+      - name: 下载并启动 Xray 代理（与 runfreecloud 相同方案）
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
+          unzip xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me || echo "(超时)"
+          echo ""
+          echo "代理 IP："
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me || echo "(代理超时，请检查 V2RAY_CONFIG)"
+          echo ""
+
+      - name: 修复 DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+          sleep 2
+
+      - name: 运行签到+续费脚本
+        env:
+          EMAIL:                ${{ secrets.FREECLOUD_EMAIL }}
+          PASSWORD:             ${{ secrets.FREECLOUD_PASSWORD }}
+          PROXY:                "socks5://127.0.0.1:10808"
+          WXPUSHER_TOKEN:       ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UID:         ${{ secrets.WXPUSHER_UID }}
+          TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:           ${{ secrets.TG_CHAT_ID }}
+          # 手动触发时用选择的值，定时触发时默认 false（不录屏节省时间）
+          ENABLE_RECORDING:     ${{ github.event_name == 'workflow_dispatch' && inputs.enable_recording || 'false' }}
+          RENEW_THRESHOLD_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.renew_threshold_days || '2' }}
+          DISPLAY:              ":99"
+        run: |
+          python sign_renew.py || echo "脚本退出码: $?"
+
+      - name: 上传截图（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 上传录屏（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ github.run_number }}
+          path: recordings/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 清理旧运行记录（保留最新 2条）
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 2
